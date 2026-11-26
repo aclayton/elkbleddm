@@ -5,6 +5,9 @@ Usage:
   led on                  Turn lights on
   led off                 Turn lights off
   led color RRGGBB        Set color (hex, e.g. FF0000 for red)
+  led color NAME          Set color by name (red, green, blue, ...)
+  led preset NAME         Apply a named preset (e.g. relax, focus, movie)
+  led presets             List available presets
   led brightness N        Set brightness (0-100)
   led white N             Set white/warmth (0-100)
   led mode N              Set built-in mode (0-??)
@@ -13,6 +16,8 @@ Usage:
 """
 import sys
 import time
+import json
+import os
 import dbus
 
 from elkbleddm_common import (
@@ -29,6 +34,63 @@ from elkbleddm_common import (
 
 # SSG1068 firmware uses 0x07 variant byte (NOT 0x04/0x00 like standard ELK-BLEDDM)
 # WARNING: 7E 00 05 and 7E 00 06 commands FREEZE this controller!
+
+NAMED_COLORS = {
+    "red": "FF0000",
+    "green": "00FF00",
+    "blue": "0000FF",
+    "white": "FFFFFF",
+    "black": "000000",
+    "off": "000000",
+    "yellow": "FFFF00",
+    "cyan": "00FFFF",
+    "magenta": "FF00FF",
+    "purple": "800080",
+    "orange": "FF8800",
+    "pink": "FF69B4",
+    "teal": "008080",
+    "warmwhite": "FFE8CC",
+    "coolwhite": "E6F0FF",
+}
+
+PRESET_FILE = os.path.expanduser("~/.config/elkbleddm/presets.json")
+
+DEFAULT_PRESETS = {
+    "relax": {"color": "FF7800", "brightness": 60},
+    "focus": {"color": "FFFFFF", "brightness": 90},
+    "movie": {"color": "640096", "brightness": 35},
+    "night": {"color": "FF3C00", "brightness": 15},
+    "party": {"color": "FF00FF", "brightness": 100},
+}
+
+
+def _load_presets():
+    """Load presets from disk, merged over defaults."""
+    presets = dict(DEFAULT_PRESETS)
+    try:
+        with open(PRESET_FILE) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            presets.update(user)
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Warning: could not read {PRESET_FILE}: {e}", file=sys.stderr)
+    return presets
+
+
+def _resolve_hex(color):
+    """Resolve a color argument (hex or name) to an uppercase 6-digit hex string."""
+    color = color.strip().lstrip("#")
+    if color.lower() in NAMED_COLORS:
+        return NAMED_COLORS[color.lower()]
+    if len(color) == 6:
+        try:
+            int(color, 16)
+            return color.upper()
+        except ValueError:
+            pass
+    raise ValueError(f"invalid color: {color!r}")
 
 
 def cmd_on():
@@ -49,14 +111,15 @@ def cmd_off():
     print("OFF")
 
 
-def cmd_color(hex_color):
+def cmd_color(color):
     ensure_connected()
+    hex_color = _resolve_hex(color)
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
     b = int(hex_color[4:6], 16)
     send(bytes([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF]))
     time.sleep(SETTLE)
-    print(f"Color: #{hex_color.upper()}")
+    print(f"Color: #{hex_color}")
 
 
 def cmd_brightness(val):
@@ -122,6 +185,26 @@ def cmd_status():
     time.sleep(SETTLE)
 
 
+def cmd_presets():
+    """List available presets."""
+    presets = _load_presets()
+    for name in sorted(presets):
+        p = presets[name]
+        print(f"{name:12s} #{p.get('color', '??????').upper()}  brightness {p.get('brightness', '-')}")
+
+
+def cmd_preset(name):
+    """Apply a named preset: color + optional brightness."""
+    presets = _load_presets()
+    if name not in presets:
+        print(f"Unknown preset: {name!r}. Available: {', '.join(sorted(presets))}")
+        sys.exit(1)
+    p = presets[name]
+    cmd_color(p.get("color", "FFFFFF"))
+    if "brightness" in p:
+        cmd_brightness(p["brightness"])
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
@@ -134,7 +217,15 @@ if __name__ == "__main__":
     elif cmd == "off":
         cmd_off()
     elif cmd == "color" and len(sys.argv) > 2:
-        cmd_color(sys.argv[2])
+        try:
+            cmd_color(sys.argv[2])
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "preset" and len(sys.argv) > 2:
+        cmd_preset(sys.argv[2])
+    elif cmd == "presets":
+        cmd_presets()
     elif cmd == "brightness" and len(sys.argv) > 2:
         cmd_brightness(sys.argv[2])
     elif cmd == "white" and len(sys.argv) > 2:

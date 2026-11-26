@@ -14,6 +14,11 @@ Linux CLI controller for SSG1068-based Bluetooth LED backlights (rebadged as ELK
 led on                  Turn lights on
 led off                 Turn lights off (disconnects BLE)
 led color RRGGBB        Set color (e.g. FF0000, 00FF00, 0000FF)
+led color NAME          Set color by name (red, green, blue, white, yellow,
+                        cyan, magenta, purple, orange, pink, teal, warmwhite,
+                        coolwhite, black)
+led preset NAME         Apply a preset (relax, focus, movie, night, party)
+led presets             List available presets
 led brightness 0-100    Set brightness
 led mode N              Built-in effects
 led speed 0-100         Effect speed
@@ -37,5 +42,19 @@ Uses the SSG1068 firmware variant of the ELK protocol:
 
 ## Device MAC
 
-Edit the `DEV_MAC` variable in `led` and `led-twirl` to match your device.
+Edit the `DEV_MAC` variable in `elkbleddm_common.py` to match your device.
 Default: `BE:68:12:00:8E:00`
+
+## Presets
+
+Presets are stored in `~/.config/elkbleddm/presets.json` (created on first use
+is not required; built-in defaults ship with the tool). Each preset maps a name
+to a `color` and optional `brightness`:
+
+```json
+{
+  "relax": {"color": "FF7800", "brightness": 60}
+}
+```
+
+User-defined presets override the built-in defaults of the same name.
