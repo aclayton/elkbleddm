@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Music-reactive color mode for the ELK-BLEDDM LED strip.
+
+Captures audio from the system microphone and drives the strip in real time:
+  - dominant frequency  -> hue (low = red, high = violet)
+  - loudness (RMS)      -> brightness
+
+The strip itself has no working microphone modes on SSG1068 firmware, so this
+reacts using the host machine's microphone instead. It streams audio via
+`arecord` (ALSA) and analyses it with numpy. The 350ms BLE settle time caps the
+reaction rate at ~3 updates/second.
+
+Usage:
+  led-music                     React to the default microphone
+  led-music --device plughw:0,0 Capture from a specific ALSA device
+  led-music --rate 48000        Use a 48kHz sample rate (default 16000)
+  led-music --gain 3            Boost sensitivity (default 2.0)
+  led-music --min-hz 80         Low end of the frequency->hue mapping
+  led-music --max-hz 3000       High end of the frequency->hue mapping
+
+Ctrl+C to stop (restores a static color).
+"""
+import sys
+import time
+import math
+import argparse
+import subprocess
+import numpy as np
+
+from elkbleddm_common import SETTLE, ensure_connected, send, disconnect
+
+CHUNK = 2048  # samples per FFT window
+
+
+def hsv_to_rgb(h, s=1.0, v=1.0):
+    """h in degrees 0-360, returns (r,g,b) 0-255."""
+    h = h % 360
+    c = v * s
+    x = c * (1 - abs((h / 60) % 2 - 1))
+    m = v - c
+    if h < 60:    r, g, b = c, x, 0
+    elif h < 120: r, g, b = x, c, 0
+    elif h < 180: r, g, b = 0, c, x
+    elif h < 240: r, g, b = 0, x, c
+    elif h < 300: r, g, b = x, 0, c
+    else:         r, g, b = c, 0, x
+    return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+
+
+def dominant_frequency(samples, rate, min_hz, max_hz):
+    """Return the dominant frequency (Hz) in [min_hz, max_hz] via FFT."""
+    n = len(samples)
+    window = samples * np.hanning(n)
+    spectrum = np.abs(np.fft.rfft(window))
+    freqs = np.fft.rfftfreq(n, d=1.0 / rate)
+    lo = int(min_hz * n / rate)
+    hi = int(max_hz * n / rate)
+    if hi >= len(spectrum):
+        hi = len(spectrum) - 1
+    if hi <= lo:
+        return min_hz
+    band = spectrum[lo:hi]
+    if band.max() == 0:
+        return min_hz
+    return freqs[lo + int(np.argmax(band))]
+
+
+def start_capture(device, rate):
+    """Spawn arecord and return its stdout pipe."""
+    cmd = ["arecord", "-D", device, "-f", "S16_LE", "-r", str(rate),
+           "-c", "1", "-t", "raw"]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def react(device, rate, gain, min_hz, max_hz):
+    ensure_connected()
+    proc = start_capture(device, rate)
+
+    # Bytes to read per reaction tick: match the BLE settle time.
+    samples_per_tick = int(rate * SETTLE)
+    bytes_per_tick = samples_per_tick * 2  # 16-bit mono
+    buf = b""
+
+    print(f"Music mode on! rate={rate}Hz, freq {min_hz}-{max_hz}Hz -> hue, "
+          f"loudness -> brightness. Press Ctrl+C to stop.", flush=True)
+
+    try:
+        while True:
+            # Read enough samples for one reaction window.
+            while len(buf) < bytes_per_tick:
+                chunk = proc.stdout.read(bytes_per_tick - len(buf))
+                if not chunk:
+                    raise RuntimeError("audio stream ended")
+                buf += chunk
+
+            tick = buf[:bytes_per_tick]
+            buf = buf[bytes_per_tick:]
+
+            samples = np.frombuffer(tick, dtype=np.int16).astype(np.float64)
+            rms = math.sqrt(np.mean(samples ** 2))
+
+            # Map loudness to brightness (0-100) with a soft floor and gain.
+            level = min(1.0, rms / (32768.0 / gain))
+            brightness = int(10 + level * 90)
+
+            # Map dominant frequency to hue: low -> red (0), high -> violet (300).
+            f = dominant_frequency(samples, rate, min_hz, max_hz)
+            frac = math.log(f / min_hz) / math.log(max_hz / min_hz)
+            hue = 300.0 * max(0.0, min(1.0, frac))
+
+            r, g, b = hsv_to_rgb(hue, v=1.0)
+            send(bytes([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF]))
+            time.sleep(SETTLE)
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+    except RuntimeError as e:
+        print(f"\nError: {e}", flush=True)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        disconnect()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Music-reactive color mode for the LED strip")
+    parser.add_argument("--device", default="default", help="ALSA capture device")
+    parser.add_argument("--rate", type=int, default=16000, help="sample rate Hz")
+    parser.add_argument("--gain", type=float, default=2.0, help="loudness sensitivity")
+    parser.add_argument("--min-hz", type=float, default=80.0)
+    parser.add_argument("--max-hz", type=float, default=3000.0)
+    args = parser.parse_args()
+    react(args.device, args.rate, args.gain, args.min_hz, args.max_hz)

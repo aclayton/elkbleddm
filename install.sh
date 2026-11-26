@@ -10,6 +10,7 @@ mkdir -p "${BIN_DIR}"
 
 install -m 755 "${SCRIPT_DIR}/led" "${BIN_DIR}/led"
 install -m 755 "${SCRIPT_DIR}/led-twirl" "${BIN_DIR}/led-twirl"
+install -m 755 "${SCRIPT_DIR}/led-music" "${BIN_DIR}/led-music"
 install -m 644 "${SCRIPT_DIR}/elkbleddm_common.py" "${BIN_DIR}/elkbleddm_common.py"
 
 # Check if ~/.local/bin is in PATH

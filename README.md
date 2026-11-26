@@ -26,6 +26,7 @@ led effects             List built-in effects
 led speed 0-100         Effect speed
 led-twirl               Color cycle animation (Ctrl+C to stop)
 led-twirl 3             Slower rotation (3 seconds)
+led-music               Music-reactive color (host mic -> hue/brightness)
 ```
 
 ## Requirements
@@ -33,6 +34,23 @@ led-twirl 3             Slower rotation (3 seconds)
 - Linux with BlueZ
 - Python 3
 - `python-dbus` and `glib2` (standard on most distros)
+- For `led-music`: `numpy` and `arecord` (ALSA), plus a working microphone
+
+## Music mode
+
+The strip has no working firmware microphone modes on SSG1068, so `led-music`
+reacts using the **host machine's microphone** instead:
+
+- dominant frequency -> hue (low notes red, high notes violet)
+- loudness (RMS) -> brightness
+- reacts at ~3 updates/sec (the 350ms BLE settle limit)
+
+```bash
+led-music                    # default mic
+led-music --gain 3           # more sensitive to quiet sounds
+led-music --min-hz 60        # shift the frequency->hue mapping
+led-music --max-hz 5000
+```
 
 ## Protocol
 
