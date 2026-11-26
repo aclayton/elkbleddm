@@ -36,9 +36,12 @@ BASS_LO, BASS_HI = 20, 250
 MID_LO, MID_HI = 250, 2000
 TREBLE_LO, TREBLE_HI = 2000, 8000
 
-# Per-band pre-emphasis gains so every band is visible in typical music.
-# Without this, bass energy dominates because low frequencies carry more power.
-BAND_GAIN = {"bass": 1.0, "mid": 3.0, "treble": 12.0}
+# Per-band pre-emphasis gains to balance the visual mix.
+# Energy is already normalised per Hz of bandwidth, so white noise
+# produces roughly flat output. A mild mid boost lifts vocals/melody;
+# treble is kept at 1.0 so ambient hiss doesn't blue-tint the idle glow.
+# Tweak these live with --gain to taste.
+BAND_GAIN = {"bass": 1.0, "mid": 1.6, "treble": 1.0}
 
 # Beat detection constants.
 RMS_EMA_ALPHA = 0.15  # how fast the baseline adapts (0-1, lower = slower)
@@ -60,7 +63,12 @@ def bin_idx(freq_hz, n_samples, rate):
 
 
 def band_energies(spectrum, n_samples, rate):
-    """Return (bass, mid, treble) energy as sum of |X|^2 in each band."""
+    """Return (bass, mid, treble) mean spectral energy per Hz in each band.
+
+    Normalising by bandwidth means white noise produces roughly equal values
+    across bands regardless of band width, so the relative pre-emphasis gains
+    actually control the colour balance rather than bandwidth differences.
+    """
     b_lo = bin_idx(BASS_LO, n_samples, rate)
     b_hi = bin_idx(BASS_HI, n_samples, rate)
     m_lo = bin_idx(MID_LO, n_samples, rate)
@@ -68,9 +76,13 @@ def band_energies(spectrum, n_samples, rate):
     t_lo = bin_idx(TREBLE_LO, n_samples, rate)
     t_hi = bin_idx(TREBLE_HI, n_samples, rate)
 
-    bass = np.sum(spectrum[b_lo:b_hi] ** 2) * BAND_GAIN["bass"]
-    mid = np.sum(spectrum[m_lo:m_hi] ** 2) * BAND_GAIN["mid"]
-    treble = np.sum(spectrum[t_lo:t_hi] ** 2) * BAND_GAIN["treble"]
+    bw_bass = max(1, BASS_HI - BASS_LO)
+    bw_mid = max(1, MID_HI - MID_LO)
+    bw_treble = max(1, TREBLE_HI - TREBLE_LO)
+
+    bass = np.sum(spectrum[b_lo:b_hi] ** 2) / bw_bass * BAND_GAIN["bass"]
+    mid = np.sum(spectrum[m_lo:m_hi] ** 2) / bw_mid * BAND_GAIN["mid"]
+    treble = np.sum(spectrum[t_lo:t_hi] ** 2) / bw_treble * BAND_GAIN["treble"]
     return bass, mid, treble
 
 
@@ -83,6 +95,10 @@ def start_capture(device, rate):
 
 def react(device, rate, gain=2.0, beat_threshold=1.4):
     ensure_connected()
+    # Power on the strip (the script assumes the strip is on, but it may not be).
+    send(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+
     proc = start_capture(device, rate)
 
     samples_per_tick = int(rate * SETTLE)
@@ -119,11 +135,17 @@ def react(device, rate, gain=2.0, beat_threshold=1.4):
             bass, mid, treble = band_energies(spectrum, n_samples, rate)
 
             # Map band energies to R, G, B via normalized proportion.
-            # Floor prevents division-by-zero flicker in silence.
+            # Large floor in denominator prevents division-by-zero in silence.
             total = bass + mid + treble + 1e8
-            r_raw = min(255, int(255 * bass / total * gain))
-            g_raw = min(255, int(255 * mid / total * gain))
-            b_raw = min(255, int(255 * treble / total * gain))
+            # If there's meaningful audio, use the spectral mix. In silence, fall
+            # back to a warm dim glow so the strip never goes fully dark.
+            sig = bass + mid + treble
+            if sig < 1e8:
+                r_raw, g_raw, b_raw = 40, 25, 15  # warm dim idle glow
+            else:
+                r_raw = min(255, int(255 * bass / total * gain))
+                g_raw = min(255, int(255 * mid / total * gain))
+                b_raw = min(255, int(255 * treble / total * gain))
 
             # ---- Beat detection ----
             rms = math.sqrt(np.mean(samples ** 2))
@@ -171,13 +193,15 @@ def react(device, rate, gain=2.0, beat_threshold=1.4):
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-        disconnect()
+        # Leave the strip on a warm low glow rather than going dark.
+        send(bytes([0x7E, 0x07, 0x05, 0x03, 50, 30, 10, 0x10, 0xEF]))
+        time.sleep(SETTLE)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Music-reactive 3-band RGB + beat detection for LED strip")
-    parser.add_argument("--device", default="default", help="ALSA capture device")
+    parser.add_argument("--device", default="plughw:0,7", help="ALSA capture device")
     parser.add_argument("--rate", type=int, default=16000, help="sample rate (Hz)")
     parser.add_argument("--gain", type=float, default=2.0,
                         help="sensitivity multiplier (default 2.0)")
