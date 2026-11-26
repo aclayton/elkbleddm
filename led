@@ -82,14 +82,17 @@ def cmd_on():
     print("ON")
 
 def cmd_off():
-    """Turn off by connecting then disconnecting (device auto-offs on BLE disconnect)."""
+    """Turn off via SSG power-off command, fall back to disconnect."""
     dev = ensure_connected()
-    time.sleep(0.3)
+    # SSG1068 power OFF: 7E 07 04 00 00 00 02 01 EF
+    send(bytes([0x7E, 0x07, 0x04, 0x00, 0x00, 0x00, 0x02, 0x01, 0xEF]))
+    time.sleep(SETTLE)
+    # Also disconnect as fallback
     try:
         dbus.Interface(dev, "org.bluez.Device1").Disconnect()
-        print("OFF")
     except:
-        print("OFF")
+        pass
+    print("OFF")
 
 def cmd_color(hex_color):
     ensure_connected()
