@@ -70,17 +70,14 @@ def cmd_on():
     print("ON")
 
 def cmd_off():
-    """Turn off by disconnecting (device auto-offs on BLE disconnect)."""
+    """Turn off by connecting then disconnecting (device auto-offs on BLE disconnect)."""
+    dev = ensure_connected()
+    time.sleep(0.3)
     try:
-        dev = bus.get_object(BUS_NAME, DEV_PATH)
-        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
-        if props.Get("org.bluez.Device1", "Connected"):
-            dbus.Interface(dev, "org.bluez.Device1").Disconnect()
-            print("OFF (disconnected)")
-        else:
-            print("Already off")
+        dbus.Interface(dev, "org.bluez.Device1").Disconnect()
+        print("OFF")
     except:
-        print("Already off")
+        print("OFF")
 
 def cmd_color(hex_color):
     ensure_connected()
