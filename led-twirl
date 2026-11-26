@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Color-twirl animation for ELK-BLEDDM LED backlight."""
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+import sys, time, math
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+BUS_NAME = "org.bluez"
+DEV_MAC = "BE:68:12:00:8E:00"
+DEV_PATH = f"/org/bluez/hci0/dev_{DEV_MAC.replace(':', '_')}"
+CHAR_PATH = f"{DEV_PATH}/service0001/char0002"
+
+bus = dbus.SystemBus()
+
+def ensure_connected():
+    try:
+        dev = bus.get_object(BUS_NAME, DEV_PATH)
+        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+        if props.Get("org.bluez.Device1", "Connected"):
+            return
+    except:
+        pass
+    adapter = dbus.Interface(
+        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
+        "org.bluez.Adapter1"
+    )
+    adapter.StartDiscovery()
+    time.sleep(2)
+    adapter.StopDiscovery()
+    dev = bus.get_object(BUS_NAME, DEV_PATH)
+    dbus.Interface(dev, "org.bluez.Device1").Connect()
+    time.sleep(1)
+
+SETTLE = 0.35  # ELK-BLEDDM requires 300ms+ between commands
+
+def send_color(r, g, b):
+    char = bus.get_object(BUS_NAME, CHAR_PATH)
+    char_iface = dbus.Interface(char, "org.bluez.GattCharacteristic1")
+    # SSG1068 firmware uses 0x07 variant: 7E 07 05 03 RR GG BB 10 EF
+    char_iface.WriteValue(
+        dbus.Array(bytes([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF]), signature='y'),
+        dbus.Dictionary({}, signature='sv')
+    )
+
+def disconnect():
+    """Disconnect from device (turns lights off)."""
+    try:
+        dev = bus.get_object(BUS_NAME, DEV_PATH)
+        dbus.Interface(dev, "org.bluez.Device1").Disconnect()
+    except:
+        pass
+
+def hsv_to_rgb(h, s=1.0, v=1.0):
+    """h in degrees 0-360, returns (r,g,b) 0-255"""
+    h = h % 360
+    c = v * s
+    x = c * (1 - abs((h / 60) % 2 - 1))
+    m = v - c
+    if h < 60:    r, g, b = c, x, 0
+    elif h < 120: r, g, b = x, c, 0
+    elif h < 180: r, g, b = 0, c, x
+    elif h < 240: r, g, b = 0, x, c
+    elif h < 300: r, g, b = x, 0, c
+    else:         r, g, b = c, 0, x
+    return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+
+def twirl(speed=2.0):
+    """Cycle through hues. speed = seconds per full rotation (min ~1.0s due to BLE settle time)."""
+    ensure_connected()
+    # ELK-BLEDDM needs 350ms between commands, so max ~3 steps/sec
+    # Use fewer steps for smooth-enough animation within BLE limits
+    steps = max(12, int(speed / SETTLE))  # at least 12 hues per rotation
+    delay = speed / steps
+    if delay < SETTLE:
+        delay = SETTLE
+        steps = int(speed / SETTLE)
+    
+    print(f"Twirling! {steps} hues, {delay:.3f}s per step. Press Ctrl+C to stop.", flush=True)
+    hue = 0
+    try:
+        while True:
+            r, g, b = hsv_to_rgb(hue)
+            send_color(r, g, b)
+            hue = (hue + 360 / steps) % 360
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+        disconnect()
+
+if __name__ == "__main__":
+    speed = float(sys.argv[1]) if len(sys.argv) > 1 else 2.0
+    twirl(speed=speed)

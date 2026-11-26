@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""
+ELK-BLEDDM LED Backlight Controller
+Usage:
+  led on                  Turn lights on
+  led off                 Turn lights off
+  led color RRGGBB        Set color (hex, e.g. FF0000 for red)
+  led brightness N        Set brightness (0-100)
+  led white N             Set white/warmth (0-100)
+  led mode N              Set built-in mode (0-??)
+  led speed N             Set mode speed (0-100)
+  led status              Query current status
+"""
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+import sys, time
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+BUS_NAME = "org.bluez"
+DEV_MAC = "BE:68:12:00:8E:00"
+DEV_PATH = f"/org/bluez/hci0/dev_{DEV_MAC.replace(':', '_')}"
+CHAR_PATH = f"{DEV_PATH}/service0001/char0002"
+
+bus = dbus.SystemBus()
+
+def ensure_connected():
+    """Connect to device if not already connected."""
+    try:
+        dev = bus.get_object(BUS_NAME, DEV_PATH)
+        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+        if props.Get("org.bluez.Device1", "Connected"):
+            return dev
+    except:
+        pass
+    
+    # Need to connect
+    adapter = dbus.Interface(
+        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
+        "org.bluez.Adapter1"
+    )
+    adapter.StartDiscovery()
+    time.sleep(2)
+    adapter.StopDiscovery()
+    
+    dev = bus.get_object(BUS_NAME, DEV_PATH)
+    dev_iface = dbus.Interface(dev, "org.bluez.Device1")
+    dev_iface.Connect()
+    time.sleep(1)
+    return dev
+
+def send(data):
+    """Send raw bytes to the LED controller."""
+    char = bus.get_object(BUS_NAME, CHAR_PATH)
+    char_iface = dbus.Interface(char, "org.bluez.GattCharacteristic1")
+    char_iface.WriteValue(
+        dbus.Array(data, signature='y'),
+        dbus.Dictionary({}, signature='sv')
+    )
+
+# SSG1068 firmware uses 0x07 variant byte (NOT 0x04/0x00 like standard ELK-BLEDDM)
+# WARNING: 7E 00 05 and 7E 00 06 commands FREEZE this controller!
+SETTLE = 0.35
+
+def cmd_on():
+    ensure_connected()
+    send(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print("ON")
+
+def cmd_off():
+    """Turn off by disconnecting (device auto-offs on BLE disconnect)."""
+    try:
+        dev = bus.get_object(BUS_NAME, DEV_PATH)
+        props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+        if props.Get("org.bluez.Device1", "Connected"):
+            dbus.Interface(dev, "org.bluez.Device1").Disconnect()
+            print("OFF (disconnected)")
+        else:
+            print("Already off")
+    except:
+        print("Already off")
+
+def cmd_color(hex_color):
+    ensure_connected()
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    send(bytes([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF]))
+    time.sleep(SETTLE)
+    print(f"Color: #{hex_color.upper()}")
+
+def cmd_brightness(val):
+    ensure_connected()
+    v = max(0, min(100, int(val)))
+    send(bytes([0x7E, 0x07, 0x01, v, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print(f"Brightness: {v}%")
+
+def cmd_white(val):
+    ensure_connected()
+    v = max(0, min(100, int(val)))
+    send(bytes([0x7E, 0x07, 0x01, v, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print(f"White: {v}%")
+
+def cmd_mode(val):
+    ensure_connected()
+    v = int(val)
+    send(bytes([0x7E, 0x07, 0x03, v, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print(f"Mode: {v}")
+
+def cmd_speed(val):
+    ensure_connected()
+    v = max(0, min(100, int(val)))
+    send(bytes([0x7E, 0x04, 0x02, v, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print(f"Speed: {v}%")
+
+def cmd_status():
+    ensure_connected()
+    send(bytes([0x7E, 0x07, 0x01, 0xFA, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+    time.sleep(SETTLE)
+    print("Status query sent")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1].lower()
+    
+    if cmd == "on":
+        cmd_on()
+    elif cmd == "off":
+        cmd_off()
+    elif cmd == "color" and len(sys.argv) > 2:
+        cmd_color(sys.argv[2])
+    elif cmd == "brightness" and len(sys.argv) > 2:
+        cmd_brightness(sys.argv[2])
+    elif cmd == "white" and len(sys.argv) > 2:
+        cmd_white(sys.argv[2])
+    elif cmd == "mode" and len(sys.argv) > 2:
+        cmd_mode(sys.argv[2])
+    elif cmd == "speed" and len(sys.argv) > 2:
+        cmd_speed(sys.argv[2])
+    elif cmd == "status":
+        cmd_status()
+    else:
+        print(__doc__)
+        sys.exit(1)
