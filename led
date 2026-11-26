@@ -22,6 +22,7 @@ BUS_NAME = "org.bluez"
 DEV_MAC = "BE:68:12:00:8E:00"
 DEV_PATH = f"/org/bluez/hci0/dev_{DEV_MAC.replace(':', '_')}"
 CHAR_PATH = f"{DEV_PATH}/service0001/char0002"
+NOTIFY_CHAR_PATH = f"{DEV_PATH}/service0001/char0004"
 
 bus = dbus.SystemBus()
 
@@ -132,10 +133,34 @@ def cmd_speed(val):
     print(f"Speed: {v}%")
 
 def cmd_status():
+    """Read device identity and connection state.
+
+    The SSG1068 firmware exposes only a firmware ID string on the notify
+    characteristic (fff4); there is no state read-back for color/brightness.
+    """
     ensure_connected()
+    dev = bus.get_object(BUS_NAME, DEV_PATH)
+    dev_props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
+    try:
+        connected = bool(dev_props.Get("org.bluez.Device1", "Connected"))
+    except dbus.exceptions.DBusException:
+        connected = False
+    print(f"Device:   {DEV_MAC}")
+    print(f"Connected: {connected}")
+    try:
+        char = bus.get_object(BUS_NAME, NOTIFY_CHAR_PATH)
+        char_iface = dbus.Interface(char, "org.bluez.GattCharacteristic1")
+        raw = char_iface.ReadValue(dbus.Dictionary({}, signature='sv'))
+        data = bytes(b for b in raw)
+        # Firmware ID is a null-padded ASCII string; strip trailing NULs.
+        fw = data.split(b"\x00")[0].decode("ascii", errors="replace")
+        print(f"Firmware:  {fw}")
+    except dbus.exceptions.DBusException as e:
+        print(f"Firmware:  (unavailable: {e})")
+    # Send a query to elicit any live response (notifications are not read here;
+    # this firmware returns only the firmware ID, not color/brightness state).
     send(bytes([0x7E, 0x07, 0x01, 0xFA, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
     time.sleep(SETTLE)
-    print("Status query sent")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
