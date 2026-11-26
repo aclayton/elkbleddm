@@ -27,26 +27,38 @@ bus = dbus.SystemBus()
 
 def ensure_connected():
     """Connect to device if not already connected."""
+    adapter = dbus.Interface(
+        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
+        "org.bluez.Adapter1"
+    )
+    
+    # Try existing device object first
     try:
         dev = bus.get_object(BUS_NAME, DEV_PATH)
         props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
         if props.Get("org.bluez.Device1", "Connected"):
             return dev
+        # Try connecting to existing object
+        dbus.Interface(dev, "org.bluez.Device1").Connect()
+        time.sleep(1)
+        return dev
+    except dbus.exceptions.DBusException:
+        pass  # Stale or missing - re-discover
     except:
         pass
     
-    # Need to connect
-    adapter = dbus.Interface(
-        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
-        "org.bluez.Adapter1"
-    )
+    # Remove stale device and re-discover
+    try:
+        adapter.RemoveDevice(DEV_PATH)
+    except:
+        pass
+    
     adapter.StartDiscovery()
-    time.sleep(2)
+    time.sleep(3)
     adapter.StopDiscovery()
     
     dev = bus.get_object(BUS_NAME, DEV_PATH)
-    dev_iface = dbus.Interface(dev, "org.bluez.Device1")
-    dev_iface.Connect()
+    dbus.Interface(dev, "org.bluez.Device1").Connect()
     time.sleep(1)
     return dev
 

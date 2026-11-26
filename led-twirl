@@ -15,19 +15,28 @@ CHAR_PATH = f"{DEV_PATH}/service0001/char0002"
 bus = dbus.SystemBus()
 
 def ensure_connected():
+    adapter = dbus.Interface(
+        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
+        "org.bluez.Adapter1"
+    )
     try:
         dev = bus.get_object(BUS_NAME, DEV_PATH)
         props = dbus.Interface(dev, "org.freedesktop.DBus.Properties")
         if props.Get("org.bluez.Device1", "Connected"):
             return
+        dbus.Interface(dev, "org.bluez.Device1").Connect()
+        time.sleep(1)
+        return
+    except dbus.exceptions.DBusException:
+        pass
     except:
         pass
-    adapter = dbus.Interface(
-        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
-        "org.bluez.Adapter1"
-    )
+    try:
+        adapter.RemoveDevice(DEV_PATH)
+    except:
+        pass
     adapter.StartDiscovery()
-    time.sleep(2)
+    time.sleep(3)
     adapter.StopDiscovery()
     dev = bus.get_object(BUS_NAME, DEV_PATH)
     dbus.Interface(dev, "org.bluez.Device1").Connect()
