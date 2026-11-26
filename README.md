@@ -21,6 +21,8 @@ led preset NAME         Apply a preset (relax, focus, movie, night, party)
 led presets             List available presets
 led brightness 0-100    Set brightness
 led mode N              Built-in effects
+led mode NAME           Built-in effect by name (rainbow, fade, ...)
+led effects             List built-in effects
 led speed 0-100         Effect speed
 led-twirl               Color cycle animation (Ctrl+C to stop)
 led-twirl 3             Slower rotation (3 seconds)
@@ -39,6 +41,25 @@ Uses the SSG1068 firmware variant of the ELK protocol:
 - Write char: `0000fff3-0000-1000-8000-00805f9b34fb`
 - Frame format: `7E 07 ... EF` (9-byte frames, variant byte `0x07`)
 - 350ms inter-command delay required
+
+## Effects
+
+Built-in effects run inside the controller and are hardware-interpolated, so
+they look smoother than the software `led-twirl` (which is limited by the 350ms
+BLE settle time and appears to step). Run `led effects` for the full list; the
+most useful ones are:
+
+| Name        | Mode | Description                              |
+|-------------|------|------------------------------------------|
+| `rainbow`   | 138  | Full rainbow crossfade (smooth)          |
+| `rainbow_rgb` | 137 | Red/green/blue crossfade               |
+| `rainbow_jump` | 136 | Full rainbow jump (no fade)            |
+| `fade`      | 137  | Alias for `rainbow_rgb`                  |
+| `crossfade_*` | 139-148 | Single/two-color crossfades           |
+| `jump_*`    | 135-136 | Discrete jumps                          |
+| `blink_*`   | 149-156 | Blink effects                          |
+
+Set speed with `led speed 0-100`.
 
 ## Device MAC
 

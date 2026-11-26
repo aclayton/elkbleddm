@@ -11,6 +11,8 @@ Usage:
   led brightness N        Set brightness (0-100)
   led white N             Set white/warmth (0-100)
   led mode N              Set built-in mode (0-??)
+  led mode NAME           Set built-in effect by name (e.g. rainbow, fade)
+  led effects             List available effects
   led speed N             Set mode speed (0-100)
   led status              Query current status
 """
@@ -30,6 +32,9 @@ from elkbleddm_common import (
     ensure_connected,
     send,
     disconnect,
+    resolve_effect,
+    EFFECTS,
+    EFFECT_ALIASES,
 )
 
 # SSG1068 firmware uses 0x07 variant byte (NOT 0x04/0x00 like standard ELK-BLEDDM)
@@ -140,10 +145,18 @@ def cmd_white(val):
 
 def cmd_mode(val):
     ensure_connected()
-    v = int(val)
+    v = resolve_effect(val)
     send(bytes([0x7E, 0x07, 0x03, v, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
     time.sleep(SETTLE)
     print(f"Mode: {v}")
+
+
+def cmd_effects():
+    """List available firmware effects."""
+    for name in sorted(EFFECTS):
+        print(f"{name:24s} {EFFECTS[name]}")
+    print()
+    print("Aliases:", ", ".join(sorted(EFFECT_ALIASES)))
 
 
 def cmd_speed(val):
@@ -231,7 +244,13 @@ if __name__ == "__main__":
     elif cmd == "white" and len(sys.argv) > 2:
         cmd_white(sys.argv[2])
     elif cmd == "mode" and len(sys.argv) > 2:
-        cmd_mode(sys.argv[2])
+        try:
+            cmd_mode(sys.argv[2])
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "effects":
+        cmd_effects()
     elif cmd == "speed" and len(sys.argv) > 2:
         cmd_speed(sys.argv[2])
     elif cmd == "status":
