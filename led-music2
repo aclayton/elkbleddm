@@ -2,53 +2,50 @@
 """Experimental music-reactive mode with layered effects.
 
 Same foundation as led-music (background reader, change-gated BLE), plus:
-  1. Beat-triggered complementary colour flash (subtle)
-  2. Energy-tiered hardware effects (quiet=crossfade, mid=RGB, intense=jump)
-  3. Between-song colour hold (freezes instead of dimming)
-  4. Genre-adaptive smoothing (BPM modulates alpha)
+  1. Beat-triggered complementary colour flash (subtle 20% blend)
+  2. Between-song colour hold (freezes last colour after 3s silence)
+  3. Genre-adaptive smoothing (BPM modulates alpha 0.25–0.45)
 
-Kept conservatively tuned for smoothness — theatrical version of led-music.
+Audio written to a temp file so arecord survives SSH disconnects.
 
 Usage:  led-music2 [--gain 2.0] [--beat-threshold 1.4]
 """
 
-import sys, time, math, argparse, subprocess, threading
+import sys, time, math, argparse, subprocess, threading, os, tempfile, shutil
 import numpy as np
-from elkbleddm_common import SETTLE, ensure_connected, send, EFFECTS
+from elkbleddm_common import SETTLE, ensure_connected, send
 
 # ── frequency bands ──────────────────────────────────────────────────
-BASS_LO, BASS_HI   = 20, 250
-MID_LO,  MID_HI    = 250, 2000
+BASS_LO, BASS_HI = 20, 250
+MID_LO, MID_HI = 250, 2000
 TREBLE_LO, TREBLE_HI = 2000, 8000
 BAND_GAIN = {"bass": 1.0, "mid": 1.6, "treble": 1.0}
 
 # ── beat detection ───────────────────────────────────────────────────
-RMS_EMA_ALPHA       = 0.15
-BEAT_COOLDOWN_TICKS  = 1
-RMS_SILENCE_FLOOR    = 40.0
+RMS_EMA_ALPHA = 0.15
+BEAT_COOLDOWN_TICKS = 1
+RMS_SILENCE_FLOOR = 40.0
 
-# ── layered effects (kept subtle) ────────────────────────────────────
-FLASH_STRENGTH      = 0.20   # how much complementary colour on beat (0–1)
-FLASH_DECAY          = 0.65   # per-tick decay back to normal
-BPM_FAST             = 140
-BPM_SLOW             = 90
-SMOOTH_SLOW          = 0.25   # alpha for slow songs
-SMOOTH_FAST          = 0.45   # alpha for fast songs
-SMOOTH_DEFAULT       = 0.35
-HOLD_TIMEOUT          = 3.0    # seconds of silence before freezing
-HOLD_RMS_THRESHOLD    = 80.0
-TIER_LOW              = 120.0
-TIER_HIGH             = 450.0
-TIER_HYSTERESIS       = 3      # ticks before switching tier
+# ── layered effects ──────────────────────────────────────────────────
+FLASH_STRENGTH = 0.20
+FLASH_DECAY = 0.65
+BPM_FAST = 140
+BPM_SLOW = 90
+SMOOTH_SLOW = 0.25
+SMOOTH_FAST = 0.45
+SMOOTH_DEFAULT = 0.35
+HOLD_TIMEOUT = 3.0
+HOLD_RMS_THRESHOLD = 80.0
 
 FFT_SIZE = 2048
 
 
 def bi(freq, n, r): return max(0, min(int(freq * n / r), n // 2))
 
+
 def band_energies(spectrum, n_samples, rate):
     b_lo, b_hi = bi(BASS_LO, n_samples, rate), bi(BASS_HI, n_samples, rate)
-    m_lo, m_hi = bi(MID_LO,  n_samples, rate), bi(MID_HI,  n_samples, rate)
+    m_lo, m_hi = bi(MID_LO, n_samples, rate), bi(MID_HI, n_samples, rate)
     t_lo, t_hi = bi(TREBLE_LO, n_samples, rate), bi(TREBLE_HI, n_samples, rate)
     bw_b = max(1, BASS_HI - BASS_LO)
     bw_m = max(1, MID_HI - MID_LO)
@@ -57,174 +54,202 @@ def band_energies(spectrum, n_samples, rate):
             np.sum(spectrum[m_lo:m_hi] ** 2) / bw_m * BAND_GAIN["mid"],
             np.sum(spectrum[t_lo:t_hi] ** 2) / bw_t * BAND_GAIN["treble"])
 
-def send_safe(data):
-    try: send(data)
-    except Exception:
-        try: ensure_connected(); time.sleep(SETTLE); send(data)
-        except Exception: pass
 
-def send_mode(mode, spd=80):
-    send_safe(bytes([0x7E, 0x07, 0x03, mode, 0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
-    time.sleep(SETTLE * 0.5)
-    send_safe(bytes([0x7E, 0x07, 0x02, spd,  0xFF, 0xFF, 0xFF, 0x00, 0xEF]))
+def send_safe(data):
+    try:
+        send(data)
+    except Exception:
+        try:
+            ensure_connected()
+            time.sleep(SETTLE)
+            send(data)
+        except Exception:
+            pass
+
 
 def send_color(r, g, b):
     send_safe(bytes([0x7E, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xEF]))
 
+
 def complementary(r, g, b): return (255 - r, 255 - g, 255 - b)
+
 
 def blend(c1, c2, t):
     return (int(c1[0] + (c2[0] - c1[0]) * t),
             int(c1[1] + (c2[1] - c1[1]) * t),
             int(c1[2] + (c2[2] - c1[2]) * t))
 
-# background reader ────────────────────────────────────────────────────
 
-def reader(proc, ring, ring_lock, stop):
-    while not stop.is_set():
-        ch = proc.stdout.read(4096)
-        if not ch: break
-        with ring_lock:
-            ring.extend(ch)
-            if len(ring) > 64000: del ring[:32000]
+# ── background reader ────────────────────────────────────────────────
 
-# main loop ────────────────────────────────────────────────────────────
+def reader(tmpfile, ring, ring_lock, stop):
+    while not stop.is_set() and not os.path.exists(tmpfile):
+        time.sleep(0.1)
+    if not os.path.exists(tmpfile):
+        return
+    with open(tmpfile, 'rb') as f:
+        while not stop.is_set():
+            ch = f.read(4096)
+            if not ch:
+                time.sleep(0.05)
+                continue
+            with ring_lock:
+                ring.extend(ch)
+                if len(ring) > 64000:
+                    del ring[:32000]
+
+
+# ── main loop ────────────────────────────────────────────────────────
 
 def react(device, rate, gain=2.0, beat_threshold=1.4):
     ensure_connected()
     send_safe(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
     time.sleep(SETTLE)
 
+    tmpdir = tempfile.mkdtemp(prefix="ledmusic2-")
+    tmpfile = os.path.join(tmpdir, "audio.raw")
+
     proc = subprocess.Popen(
         ["arecord", "-D", device, "-f", "S16_LE", "-r", str(rate),
-         "-c", "1", "-t", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+         "-c", "1", "-t", "raw", tmpfile],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     ring, lock = bytearray(), threading.Lock()
     stop_ev = threading.Event()
-    t = threading.Thread(target=reader, args=(proc, ring, lock, stop_ev), daemon=True)
+    t = threading.Thread(target=reader, args=(tmpfile, ring, lock, stop_ev),
+                         daemon=True)
     t.start()
 
-    while len(ring) < FFT_SIZE * 2: time.sleep(0.05)
+    while len(ring) < FFT_SIZE * 2:
+        time.sleep(0.05)
 
     # ── state ──────────────────────────────────────────────────────
-    rms_ema = None; beat_cd = 0; flash = 0.0
-    r_s = g_s = b_s = 0.0; beat_ts = []; bpm_ema = 120.0
-    silence_since = None; held = None
-    tier = "colour"; tier_ticks = 0; tier_ema = TIER_LOW * 2
-    last_r = last_g = last_b = -1; last_send = 0.0; last_mode = "colour"
+    rms_ema = None
+    beat_cd = 0
+    flash = 0.0
+    r_s = g_s = b_s = 0.0
+    beat_ts = []
+    bpm_ema = 120.0
+    silence_since = None
+    held = None
+    last_r = last_g = last_b = -1
+    last_send = 0.0
 
     print("Music mode 2 on!  rate=%d Hz  |  Ctrl+C to stop." % rate, flush=True)
 
     try:
         while True:
             # ── read FFT window ────────────────────────────────────
-            with lock: total = len(ring)
-            if total < FFT_SIZE * 2: time.sleep(0.01); continue
-            with lock: raw = bytes(ring[total - FFT_SIZE * 2:total])
+            with lock:
+                total = len(ring)
+            if total < FFT_SIZE * 2:
+                time.sleep(0.01)
+                continue
+            with lock:
+                raw = bytes(ring[total - FFT_SIZE * 2:total])
 
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
             win = samples * np.hanning(FFT_SIZE)
             spec = np.abs(np.fft.rfft(win))
             bass, mid, treble = band_energies(spec, FFT_SIZE, rate)
 
-            te = bass + mid + treble + 1e8; sig = bass + mid + treble
-            if sig < 1e8: base = (40, 25, 15)
+            te = bass + mid + treble + 1e8
+            sig = bass + mid + treble
+            if sig < 1e8:
+                base = (40, 25, 15)
             else:
-                base = (min(255, int(255 * bass   / te * gain)),
-                        min(255, int(255 * mid    / te * gain)),
+                base = (min(255, int(255 * bass / te * gain)),
+                        min(255, int(255 * mid / te * gain)),
                         min(255, int(255 * treble / te * gain)))
 
             # ── RMS & beat detection ───────────────────────────────
             rms = math.sqrt(np.mean(samples ** 2))
-            if rms_ema is None: rms_ema = rms
-            else: rms_ema = (1 - RMS_EMA_ALPHA) * rms_ema + RMS_EMA_ALPHA * rms
+            if rms_ema is None:
+                rms_ema = rms
+            else:
+                rms_ema = (1 - RMS_EMA_ALPHA) * rms_ema + RMS_EMA_ALPHA * rms
 
             beat = False
             if beat_cd > 0:
                 beat_cd -= 1
-                rms_ema = (1 - RMS_EMA_ALPHA * 3) * rms_ema + RMS_EMA_ALPHA * 3 * rms
+                rms_ema = ((1 - RMS_EMA_ALPHA * 3) * rms_ema +
+                           RMS_EMA_ALPHA * 3 * rms)
             elif rms > beat_threshold * rms_ema and rms_ema > RMS_SILENCE_FLOOR:
-                beat_cd = BEAT_COOLDOWN_TICKS; beat = True
+                beat_cd = BEAT_COOLDOWN_TICKS
+                beat = True
                 rms_ema = rms * 0.85
                 beat_ts.append(time.time())
-                if len(beat_ts) > 10: beat_ts = beat_ts[-10:]
+                if len(beat_ts) > 10:
+                    beat_ts = beat_ts[-10:]
                 if len(beat_ts) >= 3:
-                    iv = [beat_ts[i] - beat_ts[i - 1] for i in range(1, len(beat_ts))]
+                    iv = [beat_ts[i] - beat_ts[i - 1]
+                          for i in range(1, len(beat_ts))]
                     avg = sum(iv) / len(iv)
-                    if avg > 0.2: bpm_ema = 0.3 * (60 / avg) + 0.7 * bpm_ema
+                    if avg > 0.2:
+                        bpm_ema = 0.3 * (60 / avg) + 0.7 * bpm_ema
 
-            # ── beat flash (subtle) ────────────────────────────────
-            if beat: flash = 1.0
-            else: flash *= FLASH_DECAY
-
+            # ── beat flash ─────────────────────────────────────────
+            if beat:
+                flash = 1.0
+            else:
+                flash *= FLASH_DECAY
             colour = blend(base, complementary(*base), flash * FLASH_STRENGTH)
 
             # ── between-song hold ──────────────────────────────────
             now = time.time()
             if rms < HOLD_RMS_THRESHOLD:
-                if silence_since is None: silence_since = now
+                if silence_since is None:
+                    silence_since = now
                 elif now - silence_since > HOLD_TIMEOUT and held is None:
                     held = (int(r_s), int(g_s), int(b_s))
-            else: silence_since = None; held = None
+            else:
+                silence_since = None
+                held = None
 
-            if held: colour = held
+            if held:
+                colour = held
 
             # ── genre-adaptive smooth ──────────────────────────────
-            if   bpm_ema > BPM_FAST:  alpha = SMOOTH_FAST
-            elif bpm_ema < BPM_SLOW:  alpha = SMOOTH_SLOW
-            else:                     alpha = SMOOTH_DEFAULT
+            if bpm_ema > BPM_FAST:
+                alpha = SMOOTH_FAST
+            elif bpm_ema < BPM_SLOW:
+                alpha = SMOOTH_SLOW
+            else:
+                alpha = SMOOTH_DEFAULT
 
             r_s = alpha * colour[0] + (1 - alpha) * r_s
             g_s = alpha * colour[1] + (1 - alpha) * g_s
             b_s = alpha * colour[2] + (1 - alpha) * b_s
             ri, gi, bi = int(r_s), int(g_s), int(b_s)
 
-            # ── energy-tiered mode ─────────────────────────────────
-            tier_ema = 0.3 * rms + 0.7 * tier_ema
-            if   tier_ema < TIER_LOW:   desired = "crossfade"
-            elif tier_ema > TIER_HIGH:  desired = "jump"
-            else:                       desired = "colour"
-
-            if desired == tier: tier_ticks += 1
-            else:
-                tier_ticks -= 1
-                if tier_ticks <= -TIER_HYSTERESIS:
-                    tier = desired; tier_ticks = 0
-
             # ── BLE send ───────────────────────────────────────────
             delta = max(abs(ri - last_r), abs(gi - last_g), abs(bi - last_b))
             stale = now - last_send > SETTLE * 1.05
-
-            if tier != last_mode:
-                if tier == "crossfade":
-                    send_mode(EFFECTS["crossfade_rgb"], spd=40)
-                elif tier == "jump":
-                    send_mode(EFFECTS["jump_rgb"], spd=70)
-                else:
-                    send_color(ri, gi, bi)
-                last_mode = tier
-                last_r, last_g, last_b = ri, gi, bi
-                last_send = now
-
-            elif tier == "colour" and (delta >= 4 or stale):
+            if delta >= 4 or stale:
                 send_color(ri, gi, bi)
                 last_r, last_g, last_b = ri, gi, bi
                 last_send = now
 
             time.sleep(0.05)
 
-    except KeyboardInterrupt: print("\nStopped.", flush=True)
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
     finally:
-        stop_ev.set(); t.join(timeout=2)
+        stop_ev.set()
+        t.join(timeout=2)
         proc.terminate()
-        try: proc.wait(timeout=2)
-        except subprocess.TimeoutExpired: proc.kill()
-        send_color(50, 30, 10); time.sleep(SETTLE)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        send_color(50, 30, 10)
+        time.sleep(SETTLE)
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Experimental multi-layer music LED")
+    p = argparse.ArgumentParser(
+        description="Experimental multi-layer music LED")
     p.add_argument("--device", default="plughw:0,7")
     p.add_argument("--rate", type=int, default=16000)
     p.add_argument("--gain", type=float, default=2.0)
