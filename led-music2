@@ -82,21 +82,20 @@ def blend(c1, c2, t):
 
 # ── background reader ────────────────────────────────────────────────
 
-def reader(tmpfile, ring, ring_lock, stop):
-    while not stop.is_set() and not os.path.exists(tmpfile):
-        time.sleep(0.1)
-    if not os.path.exists(tmpfile):
-        return
-    with open(tmpfile, 'rb') as f:
-        while not stop.is_set():
-            ch = f.read(4096)
-            if not ch:
-                time.sleep(0.05)
-                continue
-            with ring_lock:
-                ring.extend(ch)
-                if len(ring) > 64000:
-                    del ring[:32000]
+def reader(fd, ring, ring_lock, stop):
+    # Read from an already-open file descriptor (pipe or FIFO).
+    # Blocks naturally when no data is available — no polling needed.
+    while not stop.is_set():
+        try:
+            ch = fd.read(4096)
+        except Exception:
+            break
+        if not ch:
+            break  # EOF — writer closed
+        with ring_lock:
+            ring.extend(ch)
+            if len(ring) > 64000:
+                del ring[:32000]
 
 
 # ── main loop ────────────────────────────────────────────────────────
