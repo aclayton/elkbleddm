@@ -1,0 +1,14 @@
+[Unit]
+Description=LED Music Visualizer (led-music2)
+After=bluetooth.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/elkbleddm
+ExecStartPre=/bin/sh -c "sed -i 's|/org/bluez/hci0|/org/bluez/hci1|g' %h/elkbleddm/elkbleddm_common.py"
+ExecStart=/usr/bin/python3 %h/elkbleddm/led-music2 --device plughw:0,0
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

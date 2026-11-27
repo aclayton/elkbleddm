@@ -106,17 +106,24 @@ def react(device, rate, gain=2.0, beat_threshold=1.4):
     send_safe(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
     time.sleep(SETTLE)
 
+    # Named pipe so the reader blocks naturally until audio arrives.
     tmpdir = tempfile.mkdtemp(prefix="ledmusic2-")
-    tmpfile = os.path.join(tmpdir, "audio.raw")
+    fifo = os.path.join(tmpdir, "audio.fifo")
+    os.mkfifo(fifo)
 
+    # arecord writes to the fifo; we read from it in the background thread.
     proc = subprocess.Popen(
         ["arecord", "-D", device, "-f", "S16_LE", "-r", str(rate),
-         "-c", "1", "-t", "raw", tmpfile],
+         "-c", "1", "-t", "raw", fifo],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Open the fifo for reading (this blocks until arecord opens it for writing).
+    # Do it in the main thread to catch errors early.
+    fifo_fd = open(fifo, 'rb')
 
     ring, lock = bytearray(), threading.Lock()
     stop_ev = threading.Event()
-    t = threading.Thread(target=reader, args=(tmpfile, ring, lock, stop_ev),
+    t = threading.Thread(target=reader, args=(fifo_fd, ring, lock, stop_ev),
                          daemon=True)
     t.start()
 
