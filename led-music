@@ -7,13 +7,12 @@ Two algorithms combined:
   2. Beat-triggered brightness pulses
      RMS spike detection with EMA baseline, cooldown, and exponential decay
 
-The 350 ms BLE settle time (~3 updates/sec) is well-matched to beat detection
-at typical music tempos (60-180 BPM = 1-3 beats/sec).
-
-Captures audio from the system microphone with `arecord` (ALSA).
+Audio is captured continuously in a background thread so no samples are
+discarded during BLE writes. Each tick reads the freshest ~128 ms window
+from the ring buffer regardless of when the last BLE write finished.
 
 Usage:
-  led-music                     React to the default microphone
+  led-music                     React to the digital mic array
   led-music --device plughw:0,0 Capture from a specific ALSA device
   led-music --rate 48000        Use a 48 kHz sample rate (default 16000)
   led-music --gain 2.0          Overall sensitivity multiplier (default 2.0)
@@ -27,48 +26,41 @@ import time
 import math
 import argparse
 import subprocess
+import threading
 import numpy as np
 
-from elkbleddm_common import SETTLE, ensure_connected, send, disconnect
+from elkbleddm_common import SETTLE, ensure_connected, send
 
 # Frequency-cutoff bins (Hz).
 BASS_LO, BASS_HI = 20, 250
 MID_LO, MID_HI = 250, 2000
 TREBLE_LO, TREBLE_HI = 2000, 8000
 
-# Per-band pre-emphasis gains to balance the visual mix.
-# Energy is already normalised per Hz of bandwidth, so white noise
-# produces roughly flat output. A mild mid boost lifts vocals/melody;
-# treble is kept at 1.0 so ambient hiss doesn't blue-tint the idle glow.
-# Tweak these live with --gain to taste.
+# Per-band pre-emphasis gains.
 BAND_GAIN = {"bass": 1.0, "mid": 1.6, "treble": 1.0}
 
 # Beat detection constants.
-RMS_EMA_ALPHA = 0.15  # how fast the baseline adapts (0-1, lower = slower)
-BEAT_BOOST = 1.9      # brightness multiplier on beat
-BEAT_DECAY = 0.55     # per-tick decay factor toward 1.0
-BEAT_COOLDOWN_TICKS = 1  # ticks to suppress after a beat (avoids double-fires)
+RMS_EMA_ALPHA = 0.15
+BEAT_BOOST = 1.9
+BEAT_DECAY = 0.55
+BEAT_COOLDOWN_TICKS = 1
 
-# Color smoothing: EMA alpha for RGB output.
+# Color smoothing.
 COLOR_SMOOTH = 0.35
 
-# Silence floor for RMS (below this, beat detection is disabled).
+# Silence floor.
 RMS_SILENCE_FLOOR = 40.0
+
+# FFT window: 128 ms of audio at 16 kHz.
+FFT_SIZE = 2048
 
 
 def bin_idx(freq_hz, n_samples, rate):
-    """Closest rfft bin index for a given frequency."""
     idx = int(freq_hz * n_samples / rate)
     return max(0, min(idx, n_samples // 2))
 
 
 def band_energies(spectrum, n_samples, rate):
-    """Return (bass, mid, treble) mean spectral energy per Hz in each band.
-
-    Normalising by bandwidth means white noise produces roughly equal values
-    across bands regardless of band width, so the relative pre-emphasis gains
-    actually control the colour balance rather than bandwidth differences.
-    """
     b_lo = bin_idx(BASS_LO, n_samples, rate)
     b_hi = bin_idx(BASS_HI, n_samples, rate)
     m_lo = bin_idx(MID_LO, n_samples, rate)
@@ -76,72 +68,99 @@ def band_energies(spectrum, n_samples, rate):
     t_lo = bin_idx(TREBLE_LO, n_samples, rate)
     t_hi = bin_idx(TREBLE_HI, n_samples, rate)
 
-    bw_bass = max(1, BASS_HI - BASS_LO)
-    bw_mid = max(1, MID_HI - MID_LO)
-    bw_treble = max(1, TREBLE_HI - TREBLE_LO)
+    bw_b = max(1, BASS_HI - BASS_LO)
+    bw_m = max(1, MID_HI - MID_LO)
+    bw_t = max(1, TREBLE_HI - TREBLE_LO)
 
-    bass = np.sum(spectrum[b_lo:b_hi] ** 2) / bw_bass * BAND_GAIN["bass"]
-    mid = np.sum(spectrum[m_lo:m_hi] ** 2) / bw_mid * BAND_GAIN["mid"]
-    treble = np.sum(spectrum[t_lo:t_hi] ** 2) / bw_treble * BAND_GAIN["treble"]
+    bass = np.sum(spectrum[b_lo:b_hi] ** 2) / bw_b * BAND_GAIN["bass"]
+    mid = np.sum(spectrum[m_lo:m_hi] ** 2) / bw_m * BAND_GAIN["mid"]
+    treble = np.sum(spectrum[t_lo:t_hi] ** 2) / bw_t * BAND_GAIN["treble"]
     return bass, mid, treble
 
 
-def start_capture(device, rate):
-    """Spawn arecord and return its stdout pipe."""
-    cmd = ["arecord", "-D", device, "-f", "S16_LE", "-r", str(rate),
-           "-c", "1", "-t", "raw"]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def send_safe(data):
+    """Send with automatic reconnect on BLE errors."""
+    try:
+        send(data)
+    except Exception:
+        try:
+            ensure_connected()
+            time.sleep(SETTLE)
+            send(data)
+        except Exception:
+            pass
+
+
+def reader_thread(proc, ring, ring_lock, stop_event):
+    """Background thread: pump audio into a ring buffer continuously."""
+    while not stop_event.is_set():
+        chunk = proc.stdout.read(4096)
+        if not chunk:
+            break
+        with ring_lock:
+            ring.extend(chunk)
+            # Keep ~1 sec of audio (32 KiB at 16 kHz mono 16-bit).
+            if len(ring) > 64000:
+                del ring[:32000]
 
 
 def react(device, rate, gain=2.0, beat_threshold=1.4):
     ensure_connected()
-    # Power on the strip (the script assumes the strip is on, but it may not be).
-    send(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
+    send_safe(bytes([0x7E, 0x07, 0x04, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0xEF]))
     time.sleep(SETTLE)
 
-    proc = start_capture(device, rate)
+    proc = subprocess.Popen(
+        ["arecord", "-D", device, "-f", "S16_LE", "-r", str(rate),
+         "-c", "1", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    samples_per_tick = int(rate * SETTLE)
-    bytes_per_tick = samples_per_tick * 2  # 16-bit mono
-    buf = b""
+    ring = bytearray()
+    ring_lock = threading.Lock()
+    stop_event = threading.Event()
+    reader = threading.Thread(target=reader_thread,
+                              args=(proc, ring, ring_lock, stop_event),
+                              daemon=True)
+    reader.start()
+
+    # Warm up: wait for enough audio.
+    while len(ring) < FFT_SIZE * 2:
+        time.sleep(0.05)
 
     # Running state.
-    rms_ema = None          # exponential moving average of RMS
-    beat_cooldown = 0       # ticks remaining in cooldown
-    beat_boost = 1.0        # current brightness multiplier
-    r_smooth = g_smooth = b_smooth = 0.0  # smoothed color
+    rms_ema = None
+    beat_cooldown = 0
+    beat_boost = 1.0
+    r_smooth = g_smooth = b_smooth = 0.0
 
     print(f"Music mode on!  rate={rate} Hz, 3-band RGB + beat detection.  "
           f"Ctrl+C to stop.", flush=True)
 
+    # Last-sent colour: only push to BLE when the value actually changes.
+    last_r = last_g = last_b = -1
+    last_send = 0.0  # epoch of last BLE write
+
     try:
         while True:
-            # Fill buffer to one tick worth of samples.
-            while len(buf) < bytes_per_tick:
-                chunk = proc.stdout.read(bytes_per_tick - len(buf))
-                if not chunk:
-                    raise RuntimeError("audio stream ended")
-                buf += chunk
+            # Pull exactly FFT_SIZE samples from the ring buffer.
+            with ring_lock:
+                total = len(ring)
+            if total < FFT_SIZE * 2:
+                time.sleep(0.01)
+                continue
+            with ring_lock:
+                raw = bytes(ring[total - FFT_SIZE * 2:total])
 
-            tick = buf[:bytes_per_tick]
-            buf = buf[bytes_per_tick:]
-
-            samples = np.frombuffer(tick, dtype=np.int16).astype(np.float64)
-            n_samples = len(samples)
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
 
             # ---- FFT for three-band energies ----
-            window = samples * np.hanning(n_samples)
+            window = samples * np.hanning(FFT_SIZE)
             spectrum = np.abs(np.fft.rfft(window))
-            bass, mid, treble = band_energies(spectrum, n_samples, rate)
+            bass, mid, treble = band_energies(spectrum, FFT_SIZE, rate)
 
-            # Map band energies to R, G, B via normalized proportion.
-            # Large floor in denominator prevents division-by-zero in silence.
             total = bass + mid + treble + 1e8
-            # If there's meaningful audio, use the spectral mix. In silence, fall
-            # back to a warm dim glow so the strip never goes fully dark.
             sig = bass + mid + treble
             if sig < 1e8:
-                r_raw, g_raw, b_raw = 40, 25, 15  # warm dim idle glow
+                r_raw, g_raw, b_raw = 40, 25, 15
             else:
                 r_raw = min(255, int(255 * bass / total * gain))
                 g_raw = min(255, int(255 * mid / total * gain))
@@ -156,56 +175,63 @@ def react(device, rate, gain=2.0, beat_threshold=1.4):
 
             if beat_cooldown > 0:
                 beat_cooldown -= 1
-                # Bump the EMA during cooldown so it catches up and avoids re-triggering
-                # inside sustained loud passages.
                 rms_ema = (1.0 - RMS_EMA_ALPHA * 3) * rms_ema + RMS_EMA_ALPHA * 3 * rms
             elif rms > beat_threshold * rms_ema and rms_ema > RMS_SILENCE_FLOOR:
                 beat_cooldown = BEAT_COOLDOWN_TICKS
                 beat_boost = BEAT_BOOST
-                # Jump the EMA immediately so this onset only fires once.
                 rms_ema = rms * 0.85
             else:
-                # Exponential decay toward 1.0.
                 beat_boost = BEAT_DECAY * beat_boost + (1.0 - BEAT_DECAY) * 1.0
 
-            # ---- Combine base color with beat boost ----
+            # ---- Combine & smooth ----
             r_out = min(255, int(r_raw * beat_boost))
             g_out = min(255, int(g_raw * beat_boost))
             b_out = min(255, int(b_raw * beat_boost))
 
-            # ---- Smooth color transitions ----
             r_smooth = COLOR_SMOOTH * r_out + (1.0 - COLOR_SMOOTH) * r_smooth
             g_smooth = COLOR_SMOOTH * g_out + (1.0 - COLOR_SMOOTH) * g_smooth
             b_smooth = COLOR_SMOOTH * b_out + (1.0 - COLOR_SMOOTH) * b_smooth
 
-            send(bytes([0x7E, 0x07, 0x05, 0x03,
-                        int(r_smooth), int(g_smooth), int(b_smooth),
-                        0x10, 0xEF]))
-            time.sleep(SETTLE)
+            r_i, g_i, b_i = int(r_smooth), int(g_smooth), int(b_smooth)
+            now = time.time()
+
+            # Send to BLE only when the colour changed meaningfully (≥4 steps
+            # in any channel) or it's been >350 ms since the last send.
+            delta = max(abs(r_i - last_r), abs(g_i - last_g), abs(b_i - last_b))
+            stale = now - last_send > SETTLE * 1.05
+            if delta >= 4 or stale:
+                send_safe(bytes([0x7E, 0x07, 0x05, 0x03,
+                            r_i, g_i, b_i, 0x10, 0xEF]))
+                last_r, last_g, last_b = r_i, g_i, b_i
+                last_send = now
+
+            # Tight sleep: analyse at ~20 Hz regardless of BLE rate.
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
-    except RuntimeError as e:
-        print(f"\nError: {e}", flush=True)
     finally:
+        stop_event.set()
+        reader.join(timeout=2)
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-        # Leave the strip on a warm low glow rather than going dark.
-        send(bytes([0x7E, 0x07, 0x05, 0x03, 50, 30, 10, 0x10, 0xEF]))
+        send_safe(bytes([0x7E, 0x07, 0x05, 0x03, 50, 30, 10, 0x10, 0xEF]))
         time.sleep(SETTLE)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Music-reactive 3-band RGB + beat detection for LED strip")
-    parser.add_argument("--device", default="plughw:0,7", help="ALSA capture device")
-    parser.add_argument("--rate", type=int, default=16000, help="sample rate (Hz)")
+    parser.add_argument("--device", default="plughw:0,7",
+                        help="ALSA capture device")
+    parser.add_argument("--rate", type=int, default=16000,
+                        help="sample rate (Hz)")
     parser.add_argument("--gain", type=float, default=2.0,
-                        help="sensitivity multiplier (default 2.0)")
+                        help="sensitivity multiplier")
     parser.add_argument("--beat-threshold", type=float, default=1.4,
-                        help="RMS multiplier to trigger a beat (default 1.4)")
+                        help="RMS multiplier to trigger a beat")
     args = parser.parse_args()
     react(args.device, args.rate, args.gain, args.beat_threshold)
